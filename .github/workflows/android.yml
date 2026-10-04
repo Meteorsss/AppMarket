@@ -35,10 +35,6 @@ jobs:
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v6
-        with:
-          # Do not cache configuration data containing signing credentials.
-          cache-exclude-paths: |
-            configuration-cache
 
       - name: Decode Signing Key
         env:
@@ -62,6 +58,7 @@ jobs:
       - name: Build Release APK
         run: |
           chmod +x gradlew
+          # Do not serialize signing credentials in the configuration cache.
           ./gradlew :app:android:assembleRelease --no-configuration-cache --stacktrace
         env:
           KEYSTORE_PATH: ${{ runner.temp }}/appmarket-signing.p12
