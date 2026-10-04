@@ -4,22 +4,28 @@ on:
   workflow_dispatch:
   push:
     branches: ["main"]
-    tags:
-      - "v*"
     paths-ignore:
       - "README.md"
-      - "doc/*"
-      - ".github/workflows/android.yml"
+      - "doc/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up JDK 21
         uses: actions/setup-java@v5
@@ -29,32 +35,78 @@ jobs:
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v6
+        with:
+          # Do not cache configuration data containing signing credentials.
+          cache-exclude-paths: |
+            configuration-cache
 
       - name: Decode Signing Key
-        run: echo ${{ secrets.SIGNING_KEY }} | base64 -d > keystore.jks
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          KEYSTORE_PASS: ${{ secrets.KEY_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for name in SIGNING_KEY KEYSTORE_PASS KEY_ALIAS KEY_PASSWORD; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Missing repository signing secret for $name"
+              exit 1
+            fi
+          done
+          umask 077
+          printf '%s' "$SIGNING_KEY" | base64 --decode > "$RUNNER_TEMP/appmarket-signing.p12"
+          keytool -list -keystore "$RUNNER_TEMP/appmarket-signing.p12" \
+            -storepass:env KEYSTORE_PASS -alias "$KEY_ALIAS" > /dev/null
 
       - name: Build Release APK
         run: |
-          ./gradlew :app:android:assembleRelease
-          echo "APK_FILE=$(find app/android/build/outputs/apk/release -name '*.apk' | head -n 1)" >> $GITHUB_ENV
+          chmod +x gradlew
+          ./gradlew :app:android:assembleRelease --no-configuration-cache --stacktrace
         env:
-          KEYSTORE_PATH: ${{ github.workspace }}/keystore.jks
+          KEYSTORE_PATH: ${{ runner.temp }}/appmarket-signing.p12
           KEYSTORE_PASS: ${{ secrets.KEY_STORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
 
-      - name: Upload APK Artifact
-        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+      - name: Verify APK and record build information
+        run: |
+          set -euo pipefail
+          mapfile -t apks < <(find app/android/build/outputs/apk/release -maxdepth 1 -name '*.apk' -type f)
+          [[ ${#apks[@]} -eq 1 ]] || { echo 'Expected exactly one release APK'; exit 1; }
+          apksigner="$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort -V | tail -n 1)"
+          [[ -n "$apksigner" ]] || { echo 'apksigner not found'; exit 1; }
+          mkdir -p dist
+          "$apksigner" verify --verbose --print-certs "${apks[0]}" | tee dist/signature-verification.txt
+          cp "${apks[0]}" dist/
+          cp app/android/build/outputs/apk/release/output-metadata.json dist/
+          (
+            cd dist
+            sha256sum -- *.apk > SHA256SUMS.txt
+          )
+          {
+            echo 'Unofficial Android release build; not signed by the upstream author.'
+            echo "Repository: $GITHUB_REPOSITORY"
+            echo "Build commit: $GITHUB_SHA"
+            echo "Build URL: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "Built at (UTC): $(date -u +%FT%TZ)"
+            echo "APK: $(basename "${apks[0]}")"
+          } > dist/build-info.txt
+          {
+            echo '### Verified Android release APK'
+            echo '```text'
+            cat dist/build-info.txt dist/SHA256SUMS.txt dist/signature-verification.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload verified APK
         uses: actions/upload-artifact@v7
         with:
-          path: ${{ env.APK_FILE }}
-          archive: false
+          name: AppMarket-Android-release
+          path: dist/
+          if-no-files-found: error
+          retention-days: 90
 
-      - name: Display APK Hashes
-        run: |
-          echo "### APK Hashes" >> $GITHUB_STEP_SUMMARY
-          echo "| Hash Type | Hash Value |" >> $GITHUB_STEP_SUMMARY
-          echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
-          echo "| SHA256 | \`$(sha256sum "$APK_FILE" | awk '{ print $1 }')\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| SHA1 | \`$(sha1sum "$APK_FILE" | awk '{ print $1 }')\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| MD5 | \`$(md5sum "$APK_FILE" | awk '{ print $1 }')\` |" >> $GITHUB_STEP_SUMMARY
+      - name: Remove temporary signing key
+        if: always()
+        run: rm -f -- "$RUNNER_TEMP/appmarket-signing.p12"
